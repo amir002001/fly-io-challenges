@@ -4,61 +4,85 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 type BroadcastMessageBody struct {
-	MessageType string `json:"type"`
-	Message     int    `json:"message"`
+	Type    string `json:"type"`
+	Message int    `json:"message"`
 }
 
+type ReadMessagReply struct {
+	Type     string `json:"type"`
+	Messages []int  `json:"messages"`
+}
+
+type MessageList struct {
+	Mu       sync.RWMutex
+	Messages []int
+}
+
+type WriteMessageBody BroadcastMessageBody
+
 func main() {
+	// this version is best effort
 	n := maelstrom.NewNode()
-
-	messageMap := make(
-		map[int]struct{},
-	) // if it's accidentally sent twice? gotta make sure idempotent
-
-	messageList := make(
-		[]int, 0,
-	)
+	messageList := MessageList{
+		Mu:       sync.RWMutex{},
+		Messages: []int{},
+	}
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
-		var body BroadcastMessageBody
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
+		var broadcastMessageBody BroadcastMessageBody
+		err := json.Unmarshal(msg.Body, &broadcastMessageBody)
+		if err != nil {
 			return err
 		}
-
-		if _, ok := messageMap[body.Message]; !ok {
-			messageMap[body.Message] = struct{}{}
-			messageList = append(messageList, body.Message)
-
-			for _, node := range n.NodeIDs() {
-				err := n.Send(node, body)
-				if err != nil {
-					return err
-				}
+		for _, node := range n.NodeIDs() {
+			writeMessage := WriteMessageBody{
+				Type:    "write",
+				Message: broadcastMessageBody.Message,
+			}
+			err := n.Send(node, writeMessage)
+			if err != nil {
+				return err
 			}
 		}
-
-		return n.Reply(msg, map[string]string{"type": "broadcast_ok"})
+		reply := map[string]string{"type": "broadcast_ok"}
+		return n.Reply(msg, reply)
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
-		response := map[string]any{
-			"type":     "read_ok",
-			"messages": messageList,
+		messageList.Mu.RLock()
+		reply := ReadMessagReply{
+			Type:     "read_ok",
+			Messages: messageList.Messages,
 		}
-		return n.Reply(msg, response)
+		messageList.Mu.RUnlock()
+
+		return n.Reply(msg, reply)
+	})
+
+	n.Handle("write", func(msg maelstrom.Message) error {
+		var writeMessageBody WriteMessageBody
+		err := json.Unmarshal(msg.Body, &writeMessageBody)
+		if err != nil {
+			return err
+		}
+		messageList.Mu.Lock()
+		messageList.Messages = append(messageList.Messages, writeMessageBody.Message)
+		messageList.Mu.Unlock()
+
+		return nil
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
-		// ignore for now
-		return n.Reply(msg, map[string]any{"type": "topology_ok"})
+		reply := map[string]string{"type": "topology_ok"}
+		return n.Reply(msg, reply)
 	})
 
-	// Execute the node's message loop. This will run until STDIN is closed.
 	if err := n.Run(); err != nil {
 		log.Printf("ERROR: %s", err)
 		os.Exit(1)
