@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -19,9 +20,17 @@ type ReadMessagReply struct {
 	Messages []int  `json:"messages"`
 }
 
-type MessageList struct {
-	Mu       sync.RWMutex
-	Messages []int
+type TopologyMessageBody struct {
+	Type     string   `json:"type"`
+	Topology Topology `json:"topology"`
+}
+
+type Topology map[string][]string
+
+type Messages struct {
+	Mu          sync.RWMutex
+	MessageList []int
+	MessageSet  map[int]struct{}
 }
 
 type WriteMessageBody BroadcastMessageBody
@@ -29,56 +38,63 @@ type WriteMessageBody BroadcastMessageBody
 func main() {
 	// this version is best effort
 	n := maelstrom.NewNode()
-	messageList := MessageList{
-		Mu:       sync.RWMutex{},
-		Messages: []int{},
+	messages := Messages{
+		Mu:          sync.RWMutex{},
+		MessageList: []int{},
+		MessageSet:  make(map[int]struct{}),
 	}
+
+	var topology Topology
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var broadcastMessageBody BroadcastMessageBody
+		reply := map[string]string{"type": "broadcast_ok"}
 		err := json.Unmarshal(msg.Body, &broadcastMessageBody)
 		if err != nil {
 			return err
 		}
-		for _, node := range n.NodeIDs() {
-			writeMessage := WriteMessageBody{
-				Type:    "write",
-				Message: broadcastMessageBody.Message,
-			}
-			err := n.Send(node, writeMessage)
-			if err != nil {
-				return err
+		messages.Mu.RLock()
+		_, ok := messages.MessageSet[broadcastMessageBody.Message]
+		messages.Mu.RUnlock()
+		if ok {
+			return n.Reply(msg, maelstrom.KeyAlreadyExists)
+		}
+		messages.Mu.Lock()
+		messages.MessageSet[broadcastMessageBody.Message] = struct{}{}
+		messages.MessageList = append(messages.MessageList, broadcastMessageBody.Message)
+		messages.Mu.Unlock()
+
+		for _, node := range topology[n.ID()] {
+			for {
+				rpcMessage, err := n.SyncRPC(context.Background(), node, broadcastMessageBody)
+				if err == nil {
+					break
+				}
 			}
 		}
-		reply := map[string]string{"type": "broadcast_ok"}
+
 		return n.Reply(msg, reply)
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
-		messageList.Mu.RLock()
+		messages.Mu.RLock()
 		reply := ReadMessagReply{
 			Type:     "read_ok",
-			Messages: messageList.Messages,
+			Messages: messages.MessageList,
 		}
-		messageList.Mu.RUnlock()
+		messages.Mu.RUnlock()
 
 		return n.Reply(msg, reply)
 	})
 
-	n.Handle("write", func(msg maelstrom.Message) error {
-		var writeMessageBody WriteMessageBody
-		err := json.Unmarshal(msg.Body, &writeMessageBody)
+	n.Handle("topology", func(msg maelstrom.Message) error {
+		var topologyMessageBody TopologyMessageBody
+		err := json.Unmarshal(msg.Body, &topologyMessageBody)
 		if err != nil {
 			return err
 		}
-		messageList.Mu.Lock()
-		messageList.Messages = append(messageList.Messages, writeMessageBody.Message)
-		messageList.Mu.Unlock()
+		topology = topologyMessageBody.Topology
 
-		return nil
-	})
-
-	n.Handle("topology", func(msg maelstrom.Message) error {
 		reply := map[string]string{"type": "topology_ok"}
 		return n.Reply(msg, reply)
 	})
